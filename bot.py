@@ -14,6 +14,7 @@ from typing import List, Dict
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from scraper import fetch_classes, DEFAULT_QUERY
@@ -197,7 +198,27 @@ def main() -> None:
             "Create a bot via @BotFather and export the token."
         )
 
-    app = Application.builder().token(token).build()
+    # Use separate clients for polling vs outgoing API calls:
+    # long-polling can occupy one connection for up to ~10s, so command replies
+    # need their own pool to avoid PoolTimeout under load.
+    api_request = HTTPXRequest(
+        connection_pool_size=8,
+        pool_timeout=10.0,
+        httpx_kwargs={"trust_env": False},
+    )
+    polling_request = HTTPXRequest(
+        connection_pool_size=2,
+        pool_timeout=10.0,
+        httpx_kwargs={"trust_env": False},
+    )
+
+    app = (
+        Application.builder()
+        .token(token)
+        .request(api_request)
+        .get_updates_request(polling_request)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("class", class_cmd))
