@@ -77,6 +77,7 @@ def _format_classes(items: List[Dict[str, str]]) -> str:
 
 def _escape_md(text: str) -> str:
     """Escape characters that break Telegram Markdown v1."""
+    text = str(text)
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
@@ -134,14 +135,15 @@ async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         filter_today = True
         args = args[1:]
 
-    query = DEFAULT_QUERY
-    if args:
-        query = " ".join(args).strip()
+    # Each remaining word is its own OR'd search term (e.g. "/class 3.0 Intermediate"
+    # matches classes containing either "3.0" OR "Intermediate").
+    query_terms = args if args else list(DEFAULT_QUERY)
 
-    msg = await update.message.reply_text(f"Searching for *{_escape_md(query)}* classes…", parse_mode=ParseMode.MARKDOWN)
+    query_display = " or ".join(_escape_md(t) for t in query_terms)
+    msg = await update.message.reply_text(f"Searching for *{query_display}* classes…", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        items = await fetch_classes(query=query)
+        items = await fetch_classes(query=query_terms)
     except Exception as exc:
         log.exception("Scraper failed")
         await msg.edit_text(f"Scrape failed: {exc}")

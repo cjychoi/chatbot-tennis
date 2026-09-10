@@ -6,6 +6,9 @@ Usage:
     results = await fetch_classes(query="3.0", category="Tennis",
                                   locations=["McKinney", "Oak Creek"])
 
+    # `query` can also be a list of terms OR'd together:
+    results = await fetch_classes(query=["3.0", "Intermediate"])
+
     # Standalone smoke-test:
     python scraper.py
 """
@@ -14,7 +17,7 @@ import os
 import re
 import asyncio
 import logging
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Sequence, Union
 
 from playwright.async_api import (
     async_playwright,
@@ -32,16 +35,17 @@ log = logging.getLogger(__name__)
 TARGET_URL = "https://impact.clubautomation.com/calendar/classes?tab=by-date"
 ALLOWED_DOMAIN = "clubautomation.com"
 
-DEFAULT_QUERY = "3.0"
+DEFAULT_QUERY = ["3.0", "Intermediate"]  # OR'd search terms
 DEFAULT_CATEGORY = "Tennis"
-DEFAULT_LOCATIONS = ["McKinney", "Oak Creek"]
+DEFAULT_LOCATIONS = ["LB Houston", "Oak Creek"]
 
 MAX_RESULTS = 30  # hard cap so we never return a massive payload
 NAV_TIMEOUT_MS = 30_000
 ACTION_TIMEOUT_MS = 5_000
 RESULTS_WAIT_MS = 2_000
 
-HEADLESS = os.environ.get("DEBUG_HEADFUL", "0") != "1"
+# HEADLESS = os.environ.get("DEBUG_HEADFUL", "0") != "1"
+HEADLESS = False
 SCREENSHOT_ON_FAIL = os.environ.get("DEBUG_SCREENSHOT", "0") == "1"
 STRICT_DOMAIN_FILTER = os.environ.get("STRICT_DOMAIN_FILTER", "0") == "1"
 
@@ -84,16 +88,54 @@ async def _safe_screenshot(page: Page, name: str = "debug") -> Optional[str]:
 # Core scraper
 # ---------------------------------------------------------------------------
 
+def _normalize_terms(query: Union[str, Sequence[str]]) -> List[str]:
+    """Turn `query` into a de-duplicated, order-preserving list of search terms."""
+    if isinstance(query, str):
+        raw = [query]
+    else:
+        raw = list(query)
+
+    terms = [t.strip() for t in raw if t and t.strip()]
+    # De-dupe while preserving first-seen order (case-insensitive).
+    seen = set()
+    deduped: List[str] = []
+    for t in terms:
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    return deduped or [""]
+
+
+def _dedupe_results(results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Merge results from multiple term searches, dropping exact duplicates."""
+    seen = set()
+    deduped: List[Dict[str, str]] = []
+    for r in results:
+        key = (r.get("date"), r.get("title"), r.get("hours"), r.get("facility"))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+    return deduped
+
+
 async def fetch_classes(
-    query: str = DEFAULT_QUERY,
+    query: Union[str, Sequence[str]] = DEFAULT_QUERY,
     category: str = DEFAULT_CATEGORY,
     locations: Optional[List[str]] = None,
 ) -> List[Dict[str, str]]:
     """
     Open the class calendar, fill in filters, and return structured results.
+
+    `query` may be a single string, or a list of terms to OR together
+    (e.g. ["3.0", "Intermediate"] returns classes matching either term).
     """
     if locations is None:
         locations = list(DEFAULT_LOCATIONS)
+
+    terms = _normalize_terms(query)
+
+    all_results: List[Dict[str, str]] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=HEADLESS)
@@ -105,19 +147,25 @@ async def fetch_classes(
             ),
         )
         context.set_default_timeout(ACTION_TIMEOUT_MS)
-        page = await context.new_page()
-
-        await page.route("**/*", _block_third_party)
 
         try:
-            results = await _scrape(page, query, category, locations)
-        except Exception:
-            if SCREENSHOT_ON_FAIL:
-                await _safe_screenshot(page, "scrape_failure")
-            raise
+            for term in terms:
+                page = await context.new_page()
+                await page.route("**/*", _block_third_party)
+                try:
+                    term_results = await _scrape(page, term, category, locations)
+                    log.info("Term %r matched %d classes", term, len(term_results))
+                    all_results.extend(term_results)
+                except Exception:
+                    if SCREENSHOT_ON_FAIL:
+                        await _safe_screenshot(page, f"scrape_failure_{term or 'blank'}")
+                    raise
+                finally:
+                    await page.close()
         finally:
             await browser.close()
 
+    results = _dedupe_results(all_results)
     return results[:MAX_RESULTS]
 
 
