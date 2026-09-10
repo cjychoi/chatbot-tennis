@@ -54,10 +54,25 @@ The bot uses **long polling** — no webhook, no open port needed.
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome message |
-| `/class` | Search for 3.0 Tennis classes at McKinney + Oak Creek |
-| `/class 4.0` | Search with a custom level |
-| `/class today` | Only show today's classes (date filter) |
+| `/class` | All available classes — default query (`3.0` or `Intermediate`) at the default locations (LB Houston + Oak Creek) |
+| `/class today` | Same as `/class`, but only today's classes |
+| `/class lbh oc fretz mc` | Classes for the **next 2 days** at the given locations (default query) — see location abbreviations below |
+| `/class 4.0` | Search with custom term(s) instead of the default query, at default locations, all dates |
+| `/class 3.0 Intermediate` | Multiple words are OR'd together — matches classes containing *either* term |
 | `/help` | Show available commands |
+
+### Location abbreviations
+
+Used as `/class` arguments to pick specific locations (automatically applies the 2-day window above):
+
+| Abbreviation | Location |
+|--------------|----------|
+| `lbh` | LB Houston |
+| `oc` | Oak Creek |
+| `fretz` | Fretz |
+| `mc` / `mk` | McKinney |
+
+> Note: `/class` arguments are treated as location abbreviations only if **every** word matches one of the abbreviations above; otherwise they're treated as custom search term(s).
 
 ## Smoke-Test the Scraper (no Telegram needed)
 
