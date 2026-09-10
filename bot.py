@@ -7,6 +7,7 @@ Run:
 
 import os
 import re
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -14,6 +15,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -117,6 +119,31 @@ def _filter_by_day_window(
     return filtered
 
 
+async def _retry_on_network_error(coro_fn, *, attempts: int = 3, base_delay: float = 2.0):
+    """
+    Run `coro_fn()` (a zero-arg async callable) with retries on transient
+    Telegram network errors (e.g. connect/read timeouts). This matters most
+    right after the scraper finishes: the CPU/network load from Playwright's
+    headless Chromium can briefly starve the asyncio loop enough that the
+    *next* Telegram API call misses its (short, ~5s) connect timeout even
+    though there's no real connectivity problem. Retrying with backoff lets
+    the request go through once things settle, instead of silently dropping
+    the result.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_fn()
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            log.warning(
+                "Telegram call failed (attempt %d/%d): %s", attempt, attempts, exc
+            )
+            if attempt < attempts:
+                await asyncio.sleep(base_delay * attempt)
+    raise last_exc
+
+
 def _chunk_message(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> List[str]:
     """Split a long message into chunks that fit Telegram's size limit."""
     if len(text) <= limit:
@@ -165,6 +192,12 @@ async def help_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — show this message",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all so unexpected exceptions are logged cleanly instead of PTB's
+    default 'No error handlers are registered' raw traceback dump."""
+    log.error("Unhandled exception while processing update %s", update, exc_info=context.error)
 
 
 async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -230,11 +263,13 @@ async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         items = await fetch_classes(query=query_terms, locations=locations)
     except Exception as exc:
         log.exception("Scraper failed")
-        await msg.edit_text(f"Scrape failed: {exc}")
+        await _retry_on_network_error(lambda: msg.edit_text(f"Scrape failed: {exc}"))
         return
 
     if not items:
-        await msg.edit_text("No classes found (try different filters or check selectors).")
+        await _retry_on_network_error(
+            lambda: msg.edit_text("No classes found (try different filters or check selectors).")
+        )
         return
 
     # Optional: restrict to the requested date window.
@@ -242,7 +277,9 @@ async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         items = _filter_by_day_window(items, day_window)
 
         if not items:
-            await msg.edit_text("No classes found for that date range.")
+            await _retry_on_network_error(
+                lambda: msg.edit_text("No classes found for that date range.")
+            )
             return
 
     if DISPLAY_CAP and DISPLAY_CAP > 0:
@@ -253,9 +290,13 @@ async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = _format_classes(capped)
 
     chunks = _chunk_message(text)
-    await msg.edit_text(chunks[0], parse_mode=ParseMode.MARKDOWN)
+    await _retry_on_network_error(
+        lambda: msg.edit_text(chunks[0], parse_mode=ParseMode.MARKDOWN)
+    )
     for extra in chunks[1:]:
-        await update.message.reply_text(extra, parse_mode=ParseMode.MARKDOWN)
+        await _retry_on_network_error(
+            lambda extra=extra: update.message.reply_text(extra, parse_mode=ParseMode.MARKDOWN)
+        )
 
 # ---------------------------------------------------------------------------
 # Entrypoint
@@ -277,14 +318,24 @@ def main() -> None:
     # Use separate clients for polling vs outgoing API calls:
     # long-polling can occupy one connection for up to ~10s, so command replies
     # need their own pool to avoid PoolTimeout under load.
+    #
+    # connect/read timeouts are bumped up from PTB's default (5s each) because
+    # outgoing calls (e.g. the edit_text after a scrape finishes) can briefly
+    # race with the CPU/network load of Playwright's headless Chromium, which
+    # can starve the event loop just long enough to blow past a 5s timer even
+    # though there's no real connectivity issue.
     api_request = HTTPXRequest(
         connection_pool_size=8,
         pool_timeout=10.0,
+        connect_timeout=20.0,
+        read_timeout=20.0,
         httpx_kwargs={"trust_env": False},
     )
     polling_request = HTTPXRequest(
         connection_pool_size=2,
         pool_timeout=10.0,
+        connect_timeout=20.0,
+        read_timeout=20.0,
         httpx_kwargs={"trust_env": False},
     )
 
@@ -298,6 +349,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("class", class_cmd))
+    app.add_error_handler(error_handler)
 
     log.info("Bot starting (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
