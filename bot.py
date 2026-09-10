@@ -8,8 +8,8 @@ Run:
 import os
 import re
 import logging
-from datetime import datetime
-from typing import List, Dict
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -25,6 +25,15 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096
 DISPLAY_CAP = 0  # 0 = no cap; show all results
+
+# Location abbreviations accepted as "/class" arguments, e.g. "/class lbh oc".
+LOCATION_ALIASES: Dict[str, str] = {
+    "lbh": "LB Houston",
+    "oc": "Oak Creek",
+    "fretz": "Fretz",
+    "mc": "McKinney",
+    "mk": "McKinney",
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -83,6 +92,31 @@ def _escape_md(text: str) -> str:
     return text
 
 
+def _filter_by_day_window(
+    items: List[Dict[str, str]], day_window: Optional[int]
+) -> List[Dict[str, str]]:
+    """
+    Keep only items whose date falls within [today, today + day_window - 1].
+    `day_window=None` means no filtering (return items unchanged).
+    """
+    if day_window is None:
+        return items
+
+    today = datetime.today().date()
+    cutoff = today + timedelta(days=day_window - 1)
+
+    filtered: List[Dict[str, str]] = []
+    for it in items:
+        try:
+            # Example: "Monday | March 02, 2026"
+            dt = datetime.strptime(it["date"], "%A | %B %d, %Y").date()
+        except Exception:
+            continue
+        if today <= dt <= cutoff:
+            filtered.append(it)
+    return filtered
+
+
 def _chunk_message(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> List[str]:
     """Split a long message into chunks that fit Telegram's size limit."""
     if len(text) <= limit:
@@ -110,7 +144,8 @@ def _chunk_message(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> List[str]:
 async def start_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hey! Use /class to see upcoming tennis classes.\n"
-        "You can also pass a custom search term, e.g. `/class 4.0` or `/class today`",
+        "You can also pass a custom search term, e.g. `/class 4.0`, "
+        "`/class today`, or `/class lbh oc` — see /help for details.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -118,9 +153,15 @@ async def start_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "*Commands*\n"
-        "/class — search for classes (default: 3.0 Tennis)\n"
-        "/class 4.0 — search with a different level\n"
-        "/class today — show only today's classes\n"
+        "/class — all available classes (default: 3.0 / Intermediate, default locations)\n"
+        "/class today — same, but only today's classes\n"
+        "/class lbh oc fretz mc — classes for the next 2 days at the given locations "
+        "(default query)\n"
+        "/class 4.0 — search with a different level/term (default locations, all dates)\n"
+        "\n"
+        "*Location abbreviations*\n"
+        "lbh = LB Houston, oc = Oak Creek, fretz = Fretz, mc/mk = McKinney\n"
+        "\n"
         "/help — show this message",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -135,15 +176,58 @@ async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         filter_today = True
         args = args[1:]
 
-    # Each remaining word is its own OR'd search term (e.g. "/class 3.0 Intermediate"
-    # matches classes containing either "3.0" OR "Intermediate").
-    query_terms = args if args else list(DEFAULT_QUERY)
+    # If every remaining word is a recognized location abbreviation
+    # (e.g. "/class lbh oc fretz mc"), use those locations with the default
+    # query and default to a 2-day (today + tomorrow) window. Otherwise,
+    # treat the remaining words as custom OR'd search terms (e.g.
+    # "/class 3.0 Intermediate" matches classes containing either term).
+    locations: Optional[List[str]] = None
+    query_terms: List[str]
+    used_location_aliases = False
+
+    if args and all(a.lower() in LOCATION_ALIASES for a in args):
+        used_location_aliases = True
+        seen = set()
+        locations = []
+        for a in args:
+            loc = LOCATION_ALIASES[a.lower()]
+            if loc not in seen:
+                seen.add(loc)
+                locations.append(loc)
+        query_terms = list(DEFAULT_QUERY)
+    else:
+        query_terms = args if args else list(DEFAULT_QUERY)
+
+    # Determine the date window: "today" always wins if given; otherwise
+    # location-alias mode defaults to a 2-day window; plain "/class" shows
+    # everything with no date filtering.
+    if filter_today:
+        day_window: Optional[int] = 1
+    elif used_location_aliases:
+        day_window = 2
+    else:
+        day_window = None
 
     query_display = " or ".join(_escape_md(t) for t in query_terms)
-    msg = await update.message.reply_text(f"Searching for *{query_display}* classes…", parse_mode=ParseMode.MARKDOWN)
+    if locations:
+        loc_display = " & ".join(_escape_md(l) for l in locations)
+        where_display = f" at *{loc_display}*"
+    else:
+        where_display = ""
+    if day_window == 1:
+        when_display = " for today"
+    elif day_window == 2:
+        when_display = " for the next 2 days"
+    else:
+        when_display = ""
+
+    msg = await update.message.reply_text(
+        f"Searching for *{query_display}* classes{where_display}{when_display}…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     try:
-        items = await fetch_classes(query=query_terms)
+        items = await fetch_classes(query=query_terms, locations=locations)
     except Exception as exc:
         log.exception("Scraper failed")
         await msg.edit_text(f"Scrape failed: {exc}")
@@ -153,22 +237,12 @@ async def class_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text("No classes found (try different filters or check selectors).")
         return
 
-    # Optional: restrict to classes on today's date.
-    if filter_today:
-        today = datetime.today().date()
-        filtered: List[Dict[str, str]] = []
-        for it in items:
-            try:
-                # Example: "Monday | March 02, 2026"
-                dt = datetime.strptime(it["date"], "%A | %B %d, %Y").date()
-            except Exception:
-                continue
-            if dt == today:
-                filtered.append(it)
-        items = filtered
+    # Optional: restrict to the requested date window.
+    if day_window is not None:
+        items = _filter_by_day_window(items, day_window)
 
         if not items:
-            await msg.edit_text("No classes found for today.")
+            await msg.edit_text("No classes found for that date range.")
             return
 
     if DISPLAY_CAP and DISPLAY_CAP > 0:

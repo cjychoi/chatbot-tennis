@@ -44,8 +44,8 @@ NAV_TIMEOUT_MS = 30_000
 ACTION_TIMEOUT_MS = 5_000
 RESULTS_WAIT_MS = 2_000
 
-# HEADLESS = os.environ.get("DEBUG_HEADFUL", "0") != "1"
-HEADLESS = False
+HEADLESS = os.environ.get("DEBUG_HEADFUL", "0") != "1"
+# HEADLESS = False
 SCREENSHOT_ON_FAIL = os.environ.get("DEBUG_SCREENSHOT", "0") == "1"
 STRICT_DOMAIN_FILTER = os.environ.get("STRICT_DOMAIN_FILTER", "0") == "1"
 
